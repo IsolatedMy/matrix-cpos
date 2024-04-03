@@ -98,13 +98,10 @@ for (auto&& [{bx, by}, block] : view.blocks()) {
   auto y_base = by * view.shape()[0];
   for (auto i : __ranges::views::iota(I(0), block.shape()[0])) {
     for (auto j : __ranges::views::iota(I(0), view.shape()[1])) {
-      if (0 == block[{i, j}]) continue;
+      if (0 == block[{i, j}]) continue;         // skip zeros in block
       for (auto kk : __ranges::views::iota(I(0), I(k))) {
         auto x_addr = x_base + i;
-        auto y_addr = y_base + j;
-        I b_addr = col_addr * k + kk;
-        I c_addr = col_addr * k + kk;
-        C[c_addr] += block[{i, j}] * B[b_addr];
+        C[x_addr] += block[{i, j}] * B[x_addr];
       }
     }
   }
