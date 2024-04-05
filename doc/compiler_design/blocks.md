@@ -23,12 +23,29 @@ Here we implement BCSR format as a representative blocked sparse format and  eac
 
 ### <a name='BCSRConstruction'></a>BCSR Construction
 
+It's recommended to use provided `mc::generate_bcsr` function to directly generate random benchmark by providing the following 5 arguments:
++ `m` and `n` describe the shape of matrix;
++ `block_height` and `block_width` describe the shape of block;
++ `nnz` specifies the number of non-zeros in sparse matrix;
+
+```c++
+auto [values, rowptr, colind, shape, a_nnz] =
+    mc::generate_bcsr(m, n, block_height, block_width, nnz);
 ```
+
+### BCSR View
+
+There are two ways to view generated BCSR matrix. First way is to use `bcsr_matrix_view`.
+
+```c++
+auto [values, rowptr, colind, shape, a_nnz] =
+    mc::generate_bcsr(m, n, block_height, block_width, nnz);
+
 mc::bcsr_matrix_view view(values.begin(), rowptr.begin(), colind.begin(),
                           shape, block_height, block_width, nnz);
 ```
 
-We need to pass 7 arguments to construct a BCSR view.
+The following 7 arguments are required to construct a BCSR view.
 + `values` is the array contains the entries of blocks from original matrix;
 + `rowptr` is the array contains the starting point of each row in block's view in `values` array;
 + `colind` is the array contains the column index of each block in block's view;
@@ -36,6 +53,8 @@ We need to pass 7 arguments to construct a BCSR view.
 + `block_height` is the first dimension of block;
 + `block_width` is the second dimension of block;
 + `nnz` is the number of non-zero elements in original matrix.
+
+In fact, `shape` and `nnz` can be deduced by other arguments. Currently, we choose to keep this redundancy.
 
 For example, for matrix $A$ as follow:
 
@@ -58,21 +77,14 @@ values: [0, 2.42, 59.26, 0, 0, 0, 85.34, 91.42, 0, 0, 82.82, 0]
 rowptr: [0, 1, 3, 3]
 colind: [0, 0, 1]
 ```
-It's recommended to use provided `mc::generate_bcsr` function to directly generate random benchmark by providing the size of matrix and block and number of non-zeros.
-```
-auto [values, rowptr, colind, shape, a_nnz] =
-    mc::generate_bcsr(m, n, block_height, block_width, nnz);
-```
 
-### <a name='UsingMdSpan'></a>Using MdSpan
-
-Another idea is to use `std::mdspan` to construct views for BCSR format.
+Another way is to use `std::mdspan` to construct views for BCSR format. Compared with `bcsr_matrix_view` way, we only pass necessary argument here. Since conversion is user-invisible, it has more user-friendly interface `mc::blocks()`.
 
 ```c++
-auto [values, rowptr, colind, shape, a_nnz] =
+auto [values, rowptr, colind, shape, nnz] =
     mc::generate_bcsr(m, n, block_height, block_width, nnz);
 
-std::experimental::mdspan a(values(), m, n);
+std::experimental::mdspan a(values(), rowptr, colind, block_shape);
 
 for (auto && [{bx, by}, block] : mc::blocks(a)) {
   auto values = std::ranges::views::values(block);
@@ -90,53 +102,41 @@ The processing flow of SpMV $c=Ab$ is designed as follows:
 + Iterate over each element in block and calculate its indices to determine the corresponding indices in $b$ and $c$. Add the resul back to $c$.
 
 ```c++
+
 mc::bcsr_matrix_view view(values.begin(), rowptr.begin(),
               colind.begin(), shape, block_height, block_width, nnz);
 
-for (auto&& [{bx, by}, block] : view.blocks()) {
-  auto x_base = bx * view.shape()[1];
-  auto y_base = by * view.shape()[0];
-  for (auto i : __ranges::views::iota(I(0), block.shape()[0])) {
-    for (auto j : __ranges::views::iota(I(0), view.shape()[1])) {
-      if (0 == block[{i, j}]) continue;         // skip zeros in block
-      for (auto kk : __ranges::views::iota(I(0), I(k))) {
-        auto x_addr = x_base + i;
-        C[x_addr] += block[{i, j}] * B[x_addr];
-      }
+auto blocks = view.blocks();
+
+std::for_each (blocks.begin(), blocks.end(), [&](Block b) {
+  auto x_base = bx * b.shape()[0];
+  auto y_base = by * b.shape()[1];
+  for (auto i : __ranges::views::iota(I(0), b.shape()[0])) {
+    for (auto j : __ranges::views::iota(I(0), b.shape()[1])) {
+      auto x_addr = x_base + i;
+      auto y_addr = y_base + j;
+      C[x_addr] += b[{i, j}] * B[y_addr];
     }
   }
-}
+});
 ```
+
+In this code, `block.shape()[0]` is the block size along the row dimension, and `block.shape()[1]` is the block size along the column dimension.
+
+<img src="fig/block-3.png" width="80%">
+
 
 ### Parallelism 
 
-We design user interface for parallelism as
-```
-mc::parallel_spmv(N, A, Fn);
-```
-
-+ `N` is the number of processors specified by user;
-+ `A` is input sparse matrix;
-+ `Fn` is the function applied on each block. By capturing by references in lambda functions, it's possible to avoid passing both input vector `b` and output vector `c` into the function.
-
-Two problems should be addressed within the function implementation of `mc::parallel_spmv`:
-1. Resource conflict. The computation for blocks on the same row require access to the same part of vector `b`. To avoid unnecessary data movement, computation for blocks located on the same row should be perfromed on the same processor. For example, the multiplcation for block 3 and 4 should be on the same processor;
-2. Load balance. Balancing the computation load across different processors is beneficial for reducing the algorithm's execution time.
-
-The pseudo code of the function is as follow:
 ```c++
-template <typename T>
-concept has_block_method = requires(T& t) {
-  { t } -> __ranges::random_access_ranges;
-  { t.blocks() } -> __ranges::forward_range;
-  { t.blocks() } -> __ranges::view;
-};
+/// Initialization
+auto [x, shape] = mc::generate_dense(n, 1);
+auto [y, shape] = mc::generate_dense(m, 1);
+auto [values, rowptr, colind, shape, nnz] =
+  mc::generate_bcsr(m, n, block_height, block_width, nnz);
 
-template <std::size_t N, has_block_method R, typename Fn>
-constexpr void parallel_spmv(integer<N> unroll_factor, R&& r, Fn&& fn) {
-  auto task_lists = task_division(N, r.blocks());
-  task_assign(task_lists, fn);
-}
+std::experimental::mdspan b(x.data(), shape[0], shape[1]);
+std::experimental::mdspan c(y.data(), shape[0], shape[1]);
+mc::bcsr_matrix_view A(values.begin(), rowptr.begin(), colind.begin(),
+                          shape, block_height, block_width, nnz);
 ```
-
-
