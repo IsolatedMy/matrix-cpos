@@ -134,7 +134,7 @@ _Function
 foreach(_zip_view __ranges, _Function __f) {
   // concept requirements
   for (auto&& it : __ranges) {
-    __f(*it);
+    __f(*it); // Can I pass zip directly to __f?
   }
   return __f;
 }
