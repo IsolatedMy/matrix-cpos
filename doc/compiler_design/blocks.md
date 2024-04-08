@@ -4,9 +4,14 @@
 * [Motivation](#Motivation)
 * [Construction](#Construction)
 	* [BCSR Construction](#BCSRConstruction)
-	* [Using MdSpan](#UsingMdSpan)
+	* [BCSR View](#BCSRView)
 * [Application](#Application)
 	* [SpMV](#SpMV)
+		* [Prepare](#Prepare)
+		* [SpMV](#SpMV-1)
+	* [Parallelism](#Parallelism)
+		* [Reductions along blocks of rows](#Reductionsalongblocksofrows)
+		* [Reductions along blocks of column](#Reductionsalongblocksofcolumn)
 
 <!-- vscode-markdown-toc-config
 	numbering=false
@@ -33,7 +38,7 @@ auto [values, rowptr, colind, shape, a_nnz] =
     mc::generate_bcsr(m, n, block_height, block_width, nnz);
 ```
 
-### BCSR View
+### <a name='BCSRView'></a>BCSR View
 
 There are two ways to view generated BCSR matrix. First way is to use `bcsr_matrix_view`.
 
@@ -97,7 +102,7 @@ for (auto && [{bx, by}, block] : mc::blocks(a)) {
 
 ### <a name='SpMV'></a>SpMV
 
-#### Prepare
+#### <a name='Prepare'></a>Prepare
 We provide a function `foreach` to iterate ranges. Its usage is like
 ```c++
 mc::bcsr_matrix_view view(values.begin(), rowptr.begin(), colind.begin(),
@@ -135,7 +140,7 @@ foreach(_zip_view __ranges, _Function __f) {
 }
 ```
 
-#### SpMV
+#### <a name='SpMV-1'></a>SpMV
 
 The processing flow of SpMV $c=Ab$ is designed as follows:
 + Iterate over each block in a sparse matrix. 
@@ -175,14 +180,14 @@ Annotations
 
 In this code, `b.shape()[0]` is the block size along the row dimension, and `b.shape()[1]` is the block size along the column dimension.
 
-<img src="fig/block-3.png" width="80%">
+<img src="fig/block-3.png" width="50%">
 
 
-### Parallelism 
+### <a name='Parallelism'></a>Parallelism 
 
-#### Reductions along blocks of rows
+#### <a name='Reductionsalongblocksofrows'></a>Reductions along blocks of rows
 
-One way to parallelize SpMV kernel is to perform reductions along the rows. Each processor only needs to store the segment of C it needs to compute, like the red box in the following figure.
+One way to parallelize SpMV kernel is to perform reductions along the row. Each processor only needs to store the segment of C it needs to compute, like the red box in the following figure.
 
 ```c++
 /// Initialization
@@ -203,8 +208,8 @@ foreach (__ranges::views::zip([A.row_blocks(), c.split(A.row_blocks().size())]),
   auto b_segs = b.split(row_block.size());
   foreach (__ranges::views::zip(row_block, b_segs), [&](auto blockzip, auto b_seg){
     auto block = std::get<2>(blockzip)
-    for (auto i : __ranges::views::iota(I(0), b.shape()[0])) {
-      for (auto j : __ranges::views::iota(I(0), b.shape()[1])) {
+    for (auto i : __ranges::views::iota(I(0), block.shape()[0])) {
+      for (auto j : __ranges::views::iota(I(0), block.shape()[1])) {
         c_seg[i] += block[i, j] * b_seg[j];
       }
     }
@@ -219,8 +224,9 @@ Annotations
 
 <img src="fig/block-4.png" width="50%">
 
-#### Reductions along blocks of column
+#### <a name='Reductionsalongblocksofcolumn'></a>Reductions along blocks of column
 
+Smilarily, another way to parallelize SpMV kernel is to perform reductions along the column.
 ```c++
 /// Initialization
 auto [x, shape] = mc::generate_dense(n, 1);
@@ -235,13 +241,13 @@ mc::bcsr_matrix_view A(values.begin(), rowptr.begin(), colind.begin(),
 
 /// Computation
 #pragma parallel for
-foreach (__ranges::views::zip([A.column_blocks(), c.split(A.column_blocks().size())]), 
-[&](auto row_block, auto c_seg){
-  auto b_segs = b.split(row_block.size());
-  foreach (__ranges::views::zip(row_block, b_segs), [&](auto blockzip, auto b_seg){
+foreach (__ranges::views::zip([A.column_blocks(), b.split(A.column_blocks().size())]), 
+[&](auto row_block, auto b_seg){
+  auto c_segs = c.split(row_block.size());
+  foreach (__ranges::views::zip(row_block, c_segs), [&](auto blockzip, auto c_seg){
     auto block = std::get<2>(blockzip)
-    for (auto i : __ranges::views::iota(I(0), b.shape()[0])) {
-      for (auto j : __ranges::views::iota(I(0), b.shape()[1])) {
+    for (auto i : __ranges::views::iota(I(0), block.shape()[0])) {
+      for (auto j : __ranges::views::iota(I(0), block.shape()[1])) {
         c_seg[i] += block[i, j] * b_seg[j];
       }
     }
