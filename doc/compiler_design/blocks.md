@@ -97,18 +97,67 @@ for (auto && [{bx, by}, block] : mc::blocks(a)) {
 
 ### <a name='SpMV'></a>SpMV
 
-The processing flow of SpMV $c=Ab$ is designed as follows:
-+ Iterate over each block in a sparse matrix. The block iterator is provided by specific interface. The details is transparent to user.
-+ Iterate over each element in block and calculate its indices to determine the corresponding indices in $b$ and $c$. Add the resul back to $c$.
+#### Prepare
+We provide a function `foreach` to iterate ranges. Its usage is like
+```c++
+mc::bcsr_matrix_view view(values.begin(), rowptr.begin(), colind.begin(),
+                          shape, block_height, block_width, nnz);
+
+foreach(view.blocks(), [&](auto){
+  // ...
+});
+```
+
+The draft function definition refers to the definition of [`std::for_each`](https://github.com/gcc-mirror/gcc/blob/d9375e490072d1aae73a93949aa158fcd2a27018/libstdc%2B%2B-v3/include/bits/stl_algo.h#L3858).
+```c++
+template<typename _ranges, typename _Function>
+_Function
+foreach(_ranges __ranges, _Function __f) {
+  // concept requirements
+  for (auto&& it : __ranges) {
+    __f(*it);
+  }
+  return __f;
+}  
+```
+
+And I try to support zip-view with `foreach`:
 
 ```c++
+template<typename _zip_view, typename _Function>
+_Function
+foreach(_zip_view __ranges, _Function __f) {
+  // concept requirements
+  for (auto&& it : __ranges) {
+    __f(*it);
+  }
+  return __f;
+}
+```
 
-mc::bcsr_matrix_view view(values.begin(), rowptr.begin(),
+#### SpMV
+
+The processing flow of SpMV $c=Ab$ is designed as follows:
++ Iterate over each block in a sparse matrix. 
++ Iterate over each element in block and calculate its indices to determine the corresponding indices in $b$ and $c$.
+
+```c++
+auto [x, shape] = mc::generate_dense(n, 1);
+auto [y, shape] = mc::generate_dense(m, 1);
+auto [values, rowptr, colind, shape, nnz] =
+  mc::generate_bcsr(m, n, block_height, block_width, nnz);
+
+std::experimental::mdspan b(x.data(), shape[0], shape[1]);
+std::experimental::mdspan c(y.data(), shape[0], shape[1]);
+mc::bcsr_matrix_view A(values.begin(), rowptr.begin(),
               colind.begin(), shape, block_height, block_width, nnz);
 
-auto blocks = view.blocks();
+auto blocks = A.blocks();
 
-std::for_each (blocks.begin(), blocks.end(), [&](Block b) {
+foreach(blocks, [&](auto blockzip) { 
+  auto bx = std::get<0>(blockzip);
+  auto by = std::get<1>(blockzip);
+  auto b = std::get<2>(blockzip);
   auto x_base = bx * b.shape()[0];
   auto y_base = by * b.shape()[1];
   for (auto i : __ranges::views::iota(I(0), b.shape()[0])) {
@@ -121,12 +170,19 @@ std::for_each (blocks.begin(), blocks.end(), [&](Block b) {
 });
 ```
 
-In this code, `block.shape()[0]` is the block size along the row dimension, and `block.shape()[1]` is the block size along the column dimension.
+Annotations
++ I'don't know if there is a better way to unpack the block index and block from `blockzip`. Or is there another way to access the position of block?
+
+In this code, `b.shape()[0]` is the block size along the row dimension, and `b.shape()[1]` is the block size along the column dimension.
 
 <img src="fig/block-3.png" width="80%">
 
 
 ### Parallelism 
+
+#### Reductions along blocks of rows
+
+One way to parallelize SpMV kernel is to perform reductions along the rows. Each processor only needs to store the segment of C it needs to compute, like the red box in the following figure.
 
 ```c++
 /// Initialization
@@ -139,4 +195,56 @@ std::experimental::mdspan b(x.data(), shape[0], shape[1]);
 std::experimental::mdspan c(y.data(), shape[0], shape[1]);
 mc::bcsr_matrix_view A(values.begin(), rowptr.begin(), colind.begin(),
                           shape, block_height, block_width, nnz);
+
+/// Computation
+#pragma parallel for
+foreach (__ranges::views::zip([A.row_blocks(), c.split(A.row_blocks().size())]), 
+[&](auto row_block, auto c_seg){
+  auto b_segs = b.split(row_block.size());
+  foreach (__ranges::views::zip(row_block, b_segs), [&](auto blockzip, auto b_seg){
+    auto block = std::get<2>(blockzip)
+    for (auto i : __ranges::views::iota(I(0), b.shape()[0])) {
+      for (auto j : __ranges::views::iota(I(0), b.shape()[1])) {
+        c_seg[i] += block[i, j] * b_seg[j];
+      }
+    }
+  });
+});
+```
+
+Annotations
++ I use OpenMp-like grammar to call threads to execute the foreach-loop here;
++ Both foreach-loop is the second scenerio;
++ Here I assume `split` is a cpo used to split dense vector into equal-size portion.
+
+<img src="fig/block-4.png" width="50%">
+
+#### Reductions along blocks of column
+
+```c++
+/// Initialization
+auto [x, shape] = mc::generate_dense(n, 1);
+auto [y, shape] = mc::generate_dense(m, 1);
+auto [values, rowptr, colind, shape, nnz] =
+  mc::generate_bcsr(m, n, block_height, block_width, nnz);
+
+std::experimental::mdspan b(x.data(), shape[0], shape[1]);
+std::experimental::mdspan c(y.data(), shape[0], shape[1]);
+mc::bcsr_matrix_view A(values.begin(), rowptr.begin(), colind.begin(),
+                          shape, block_height, block_width, nnz);
+
+/// Computation
+#pragma parallel for
+foreach (__ranges::views::zip([A.column_blocks(), c.split(A.column_blocks().size())]), 
+[&](auto row_block, auto c_seg){
+  auto b_segs = b.split(row_block.size());
+  foreach (__ranges::views::zip(row_block, b_segs), [&](auto blockzip, auto b_seg){
+    auto block = std::get<2>(blockzip)
+    for (auto i : __ranges::views::iota(I(0), b.shape()[0])) {
+      for (auto j : __ranges::views::iota(I(0), b.shape()[1])) {
+        c_seg[i] += block[i, j] * b_seg[j];
+      }
+    }
+  });
+});
 ```
