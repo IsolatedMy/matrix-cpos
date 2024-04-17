@@ -114,7 +114,7 @@ template <typename KernelName, class KernelFunction>
 void parallel_for(sycl::range<dimensions> numWorkItems, KernelType);
 ```
 
-We design a extended version of `parallel_for` function.
+We design a extended version of `parallel_for` function. Its application scenario is that 1)the first parameter is sparse, and 2)the useful range of the second parameter is specifid by the first parameter.
 ```c++
 template <typename T>
 concept has_split_method = requires(T& t) {
@@ -125,9 +125,6 @@ concept has_split_method = requires(T& t) {
 template <has_split_method T, typename _Function>
 void parallel_for(T A, T b, _Function __f) {
   auto units = A.split();
-  auto A_values = units | __ranges::views::transform([*this](auto unit) {
-    return unint.value;
-  });
   // This is a immature implementation based on the assumption that `b` can be randomly accessed
   // If not, the implementation should be handed over to `b.split()` for completion
   auto b_values = units | __ranges::views::transform([*this](auto unit) {
@@ -135,7 +132,7 @@ void parallel_for(T A, T b, _Function __f) {
     return b.split()[pos].value;
   });
   // Here we need more information (e.g. target type) to give a more specific implementation
-  for (auto&& [A_value, b_value] : std::views::zip(A_values, b_values)) {
+  for (auto&& [A_value, b_value] : std::views::zip(units, b_values)) {
     __f(A_value, b_value);
   }
 }
@@ -190,7 +187,7 @@ In this code, `b.shape()[0]` is the block size along the row dimension, and `b.s
 
 One way to parallelize SpMV kernel is to perform reductions along the row. Each processor only needs to store the segment of C it needs to compute, like the red box in the following figure.
 
-With respect to the `using` statement, my idea is to set one of cpos of view as the alias of `split` function. So when we call `split` function, what we actually call is the specified cpo. If the container is only range, defaultly, we use its `begin()` and `end()` to access each element without extra specification. 
+<!-- With respect to the `using` statement, my idea is to set one of cpos of view as the alias of `split` function. So when we call `split` function, what we actually call is the specified cpo. If the container is only range, defaultly, we use its `begin()` and `end()` to access each element without extra specification.  -->
 ```c++
 /// Initialization
 auto [x, shape] = mc::generate_dense(n, 1);
@@ -206,8 +203,8 @@ mc::bcsr_matrix_view A(values, rowptr, colind,
 using bcsr_matrix_view::split = bcsr_matrix_view::row_blocks();
 
 mc::parallel_for(A, c, [&](auto row_block, auto c_sub){
-  mc::parallel_for(row_block, b, [&](auto block, auto b_sub){
-    auto block = std::get<2>(blockzip);
+  mc::parallel_for(row_block.value, b, [&](auto blockzip, auto b_sub){
+    auto block = blockzip.value;
     for (auto i = 0; i < block.height; ++ i) {
       for (auto j = 0; j < block.width; ++ j) {
         c_sub[i] += block[i, j] * b_sub[j];
@@ -217,8 +214,25 @@ mc::parallel_for(A, c, [&](auto row_block, auto c_sub){
 });
 ```
 
-<img src="fig/block-4.png" width="50%">
+If we only pass one parameter to `parallel_for`, it's more atomic but less user-friendly.
 
+```c++
+mc::parallel_for(A, [&](auto row_blocks){ // Loop 1
+  auto c_sub = c.split()[row_blocks.pos];
+  mc::parallel_for(row_blocks, [&](auto blockzip) { // Loop 2
+    auto b_sub = b.split()[blockzip.pos];
+    auto block = blockzip.value;
+    for (auto i = 0; i < block.height; ++ i) {
+      for (auto j = 0; j < block.width; ++ j) {
+        c_sub[i] += block[i, j] * b_sub[j];
+      }
+    } 
+  });
+});
+```
+
+<img src="fig/block-4.png" width="50%">
+<!-- 
 #### <a name='Reductionsalongblocksofcolumn'></a>Reductions along blocks of column
 
 Smilarily, another way to parallelize SpMV kernel is to perform reductions along the column. 
@@ -237,8 +251,8 @@ mc::bcsr_matrix_view A(values, rowptr, colind,
 using bcsr_matrix_view::split = bcsr_matrix_view::column_blocks();
 
 mc::parallel_for(A, c, [&](auto row_block, auto c_sub){
-  mc::parallel_for(column_block, b, [&](auto block, auto b_sub){
-    auto block = std::get<2>(blockzip);
+  mc::parallel_for(column_block, b, [&](auto blockzip, auto b_sub){
+    auto block = blockzip.value;
     for (auto i = 0; i < block.height; ++ i) {
       for (auto j = 0; j < block.width; ++ j) {
         c_sub[i] += block[i, j] * b_sub[j];
@@ -268,4 +282,4 @@ constexpr void unrolled_for_each(integer<N> unroll_factor, R&& r, Fn&& fn) {
 
 }
 ```
-
+ -->
