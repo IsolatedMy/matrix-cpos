@@ -187,7 +187,9 @@ In this code, `b.shape()[0]` is the block size along the row dimension, and `b.s
 
 One way to parallelize SpMV kernel is to perform reductions along the row. Each processor only needs to store the segment of C it needs to compute, like the red box in the following figure.
 
-<!-- With respect to the `using` statement, my idea is to set one of cpos of view as the alias of `split` function. So when we call `split` function, what we actually call is the specified cpo. If the container is only range, defaultly, we use its `begin()` and `end()` to access each element without extra specification.  -->
+With respect to the `using` statement, my idea is to set one of cpos of view as the alias of `split` function. So when we call `split` function, what we actually call is the specified cpo. If the container is only range, defaultly, we use its `begin()` and `end()` to access each element without extra specification. 
+
+And I assume `row_block` is comprised of `pos` and `value`. `pos` represents the index of this row and `value` is the container of blocks.
 ```c++
 /// Initialization
 auto [x, shape] = mc::generate_dense(n, 1);
@@ -214,7 +216,7 @@ mc::parallel_for(A, c, [&](auto row_block, auto c_sub){
 });
 ```
 
-If we only pass one parameter to `parallel_for`, it's more atomic but less user-friendly.
+If we only pass one parameter to `parallel_for`, which is a different overload and is not shown in the previous section, it's more atomic but less user-friendly. 
 
 ```c++
 mc::parallel_for(A, [&](auto row_blocks){ // Loop 1
