@@ -15,7 +15,7 @@ int main() {
     auto [values, rowptr, colind, shape, a_nnz] =
         mc::generate_bcsr(m, n, block_height, block_width, nnz);
 
-    mc::bcsr_matrix_view view(values.begin(), rowptr.begin(), colind.begin(),
+    mc::bcsr_matrix_view view(values, rowptr, colind,
                               shape, block_height, block_width, nnz);
 
     fmt::print("values: {}\n", values);

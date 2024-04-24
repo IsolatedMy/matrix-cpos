@@ -11,7 +11,8 @@
 
 namespace mc {
 
-template <typename T, typename I, std::forward_iterator TIter = T*,
+template <typename T, typename I,
+          std::forward_iterator TIter = T*,
           std::forward_iterator IIter = I*>
 class bcsr_matrix_view
     : public __ranges::view_interface<bcsr_matrix_view<T, I, TIter, IIter>> {
@@ -27,10 +28,10 @@ public:
   using key_type = mc::index<I>;
   using map_type = T;
 
-  bcsr_matrix_view(TIter values, IIter rowptr, IIter colind, key_type shape,
-                   size_type block_height, size_type block_width, size_type nnz)
-      : values_(values), rowptr_(rowptr), colind_(colind), shape_(shape),
-        block_height_(block_height), block_width_(block_width), nnz_(nnz) {}
+  template <__ranges::random_access_range V, __ranges::random_access_range R,
+            __ranges::random_access_range C>
+  bcsr_matrix_view(V&& values, R&& rowptr, C&& colind, key_type shape,
+                  size_type block_height, size_type block_width, size_type nnz) {}
 
   key_type shape() const noexcept { return shape_; }
 
@@ -131,9 +132,10 @@ private:
   size_type nnz_;
 };
 
-template <typename TIter, typename IIter, typename... Args>
-bcsr_matrix_view(TIter, IIter, IIter, Args&&...)
-    -> bcsr_matrix_view<std::iter_value_t<TIter>, std::iter_value_t<IIter>,
-                        TIter, IIter>;
+template<__ranges::random_access_range V, __ranges::random_access_range R,
+         __ranges::random_access_range C, typename... Args>
+bcsr_matrix_view(V&&, R&&, C&&, Args&&...)
+  -> bcsr_matrix_view<__ranges::range_value_t<V>, __ranges::range_value_t<R>, 
+                      __ranges::iterator_t<V>, __ranges::iterator_t<R>>;
 
 } // namespace mc
