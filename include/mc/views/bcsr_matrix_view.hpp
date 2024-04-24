@@ -31,7 +31,8 @@ public:
   template <__ranges::random_access_range V, __ranges::random_access_range R,
             __ranges::random_access_range C>
   bcsr_matrix_view(V&& values, R&& rowptr, C&& colind, key_type shape,
-                  size_type block_height, size_type block_width, size_type nnz) {}
+                  size_type block_height, size_type block_width, size_type nnz) 
+                  : values_(__ranges::begin(values)), rowptr_(__ranges::begin(rowptr)), colind_(__ranges::begin(colind)), shape_(shape), block_height_(block_height), block_width_(block_width) {}
 
   key_type shape() const noexcept { return shape_; }
 
@@ -104,6 +105,10 @@ public:
         return A;
     });
     return __ranges::views::zip(column_indices, row_block_values);
+  }
+
+  auto row_blocks() const {
+    return blocks();
   }
 
   auto blocks() const {
