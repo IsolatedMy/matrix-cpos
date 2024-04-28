@@ -5,13 +5,6 @@
 * [Construction](#Construction)
 	* [BCSR Construction](#BCSRConstruction)
 	* [BCSR View](#BCSRView)
-* [Application](#Application)
-	* [SpMV](#SpMV)
-		* [Prepare](#Prepare)
-		* [SpMV](#SpMV-1)
-	* [Parallelism](#Parallelism)
-		* [Reductions along blocks of rows](#Reductionsalongblocksofrows)
-		* [Reductions along blocks of column](#Reductionsalongblocksofcolumn)
 
 <!-- vscode-markdown-toc-config
 	numbering=false
@@ -25,6 +18,8 @@ Existing customization points include `row`, `column` and `diagonal`. Besides th
 
 ## <a name='Construction'></a>Construction
 Here we implement BCSR format as a representative blocked sparse format and  each block is a `dense_matrix_view`. 
+
+**BCSR**(Blocked Compressed Sparse Row) format is thought to be able to achieve resonable performance improvements compared to CSR with proper block size selected. Every block of BCSR is treated as a dense block, which may require padding with zeros. 
 
 ### <a name='BCSRConstruction'></a>BCSR Construction
 
@@ -41,8 +36,6 @@ auto [values, rowptr, colind, shape, a_nnz] =
 ### <a name='BCSRView'></a>BCSR View
 
 There are two ways to view generated BCSR matrix. First way is to use `bcsr_matrix_view`.
-
-> ToDo: Align the actual code with the design of `bcsr_matrix_view` creator here.
 
 ```c++
 auto [values, rowptr, colind, shape, block_height, block_width, a_nnz] =
@@ -87,201 +80,80 @@ colind: [0, 0, 1]
 
 Another way is to use `std::mdspan` to construct views for BCSR format. Compared with `bcsr_matrix_view` way, we only pass necessary argument here. Since conversion is user-invisible, it has more user-friendly interface `mc::blocks()`.
 
-> ToDo: Align the actual code with the design of `mdspan` here.
+### Application: SpMV
+
+<img src="fig/block-3.png" width=50%>
+
+The following version is a static load balancing version of SpMV. Note the following points:
++ `Sch` represents the strategy for parallelizing;
++ The multiplication between block and vector $b$ need to compute the offset to add the result back to C. It's reasonable to compute offsets directly with `group_id` and `thread_id`, because we use static load balancing. In the following code, we assume `group_id` equals to the row base address of the block `x_base`, and `thread_id` equals to the column base address of the block `y_base`, as shown in the figure.
++ Currently, block and vector `b` and `c` are all stored in global memory.
++ `block.shape()` can be implemented as `block.width()` and `block.height()`.
 
 ```c++
-auto [values, rowptr, colind, shape, nnz] =
-    mc::generate_bcsr(m, n, block_height, block_width, nnz);
+template <block_iterable A, typename Sch>
+void multiply(A&& a, B&& b, Sch&& S) {
+ 
+  auto num_groups = 5;
+  auto r = ndrange{num_groups, 512};
+  auto a_blocks = a.blocks();
 
-std::experimental::mdspan a(values, rowptr, colind, block_shape);
-
-for (auto && [{bx, by}, block] : mc::blocks(a)) {
-  auto values = std::ranges::views::values(block);
-  fmt::print("A {} x {} block at {}, {} containing values {}\n",
-                   block_height, block_width, bx, by, values);
+  auto balanced_blocks = static_load_balancer(a_blocks, num_groups, S);
+ 
+  q.parallel_for(r, [=](auto id) {
+    auto group_id = id.get_group().get_id();
+    auto thread_id = id.get_local_id(0);
+    
+    if (group_id < balanced_blocks.size()) {
+      auto blocks = balanced_blocks[group_id];
+      if (thread_id < blocks.size()) {
+        auto block = blocks[thread_id];
+        
+        // Treat block as dense_matrix_view
+        for (std::size_t i = 0; i < block.shape()[0]; i ++) {
+          for (std::size_t j = 0; j < block.shape()[1]; j ++) {
+            auto x_addr = group_id + i;
+            auto y_addr = thread_id + j;
+            c[x_addr] += block[{i, j}] * b[y_addr];
+          }
+        }
+      }
+    }
+  }).wait();
 }
 ```
 
-## <a name='Application'></a>Application 
+The following is a dynamic load balancing version of SpMV. Compared with static load balancing version, the following points need to be noted:
++ Since multiple threads can request block from `balanced_blocks`, I think it's necessary to set the read of `balanced_blocks` as atomic operation.
 
-### <a name='SpMV'></a>SpMV
-
-#### <a name='Prepare'></a>Prepare
-
-We use the `parallel_for` from SYCL standard.
 ```c++
-template <typename KernelName, class KernelFunction> 
-void parallel_for(sycl::range<dimensions> numWorkItems, KernelType);
-```
+template <block_iterable A, typename Sch>
+void multiply(A&& a, B&& b, Sch&& S) {
+ 
+  auto num_groups = 5;
+  auto r = ndrange{num_groups, 512};
+  auto a_blocks = a.blocks();
 
-We design a extended version of `parallel_for` function. Its application scenario is that 1)the first parameter is sparse, and 2)the useful range of the second parameter is specifid by the first parameter.
-```c++
-template <typename T>
-concept has_split_method = requires(T& t) {
-  { t.split() } -> __ranges::forward_range;
-  { t.split() } -> __ranges::view;
-};
-
-template <has_split_method T, typename _Function>
-void parallel_for(T A, T b, _Function __f) {
-  auto units = A.split();
-  // This is a immature implementation based on the assumption that `b` can be randomly accessed
-  // If not, the implementation should be handed over to `b.split()` for completion
-  auto b_values = units | __ranges::views::transform([*this](auto unit) {
-    auto pos = unit.pos;
-    return b.split()[pos].value;
-  });
-  // Here we need more information (e.g. target type) to give a more specific implementation
-  for (auto&& [A_value, b_value] : std::views::zip(units, b_values)) {
-    __f(A_value, b_value);
-  }
+  auto balanced_blocks = dynamic_load_balancer(a_blocks, num_groups, S);
+ 
+  q.parallel_for(r, [=](auto id) {
+    auto group_id = id.get_group().get_id();
+    auto thread_id = id.get_local_id(0);
+    
+    atomic_ref<...> atomic_data(balanced_blocks);
+    auto&& blockZip = balanced_blocks.pop();
+    if (blockZip) {
+      auto x_base = blockZip.base()[0];
+      auto y_base = blockZip.base()[1];
+      auto block = blockZip.value();
+      for (std::size_t i = 0; i < block.shape()[0]; i ++) {
+        for (std::size_t j = 0; j < block.shape()[1]; j ++) {
+          auto x_addr = x_base + i;
+          auto y_addr = y_base + j;
+          c[x_addr] += block[{i, j}] * b[y_addr];
+        }
+      }
+    }
+  }).wait();
 }
 ```
-
-#### <a name='SpMV-1'></a>SpMV
-
-The processing flow of SpMV $c=Ab$ is designed as follows:
-+ Iterate over each block in a sparse matrix. 
-+ Iterate over each element in block and calculate its indices to determine the corresponding indices in $b$ and $c$.
-
-Here `bcsr_matrix_view` only provides `blocks()` interface to return a set of `BlockZip` objects. Each `BlockZip` is comprised of the position of block in sparse matrix ( `bx` and `by` ) and the elements in block (`block`). Here the container returned by `blocks()` supports random access.
-
-```c++
-auto [x, shape] = mc::generate_dense(n, 1);
-auto [y, shape] = mc::generate_dense(m, 1);
-auto [values, rowptr, colind, shape, nnz] =
-  mc::generate_bcsr(m, n, block_height, block_width, nnz);
-
-std::experimental::mdspan b(x.data(), shape[0], shape[1]);
-std::experimental::mdspan c(y.data(), shape[0], shape[1]);
-mc::bcsr_matrix_view A(values, rowptr,
-              colind, shape, block_height, block_width, nnz);
-
-auto blocks = A.blocks();
-
-mc::parallel_for(range<1>(blocks.size), [&](item<1> id) { 
-  auto blockzip = blocks[id];
-  auto bx = std::get<0>(blockzip);
-  auto by = std::get<1>(blockzip);
-  auto block = std::get<2>(blockzip);
-  auto x_base = bx * block.shape()[0];
-  auto y_base = by * block.shape()[1];
-  for (auto i=0; i < block.shape()[0]; i++) {
-    for (auto j=0; i < block.shape()[1]; j++) {
-      auto x_addr = x_base + i;
-      auto y_addr = y_base + j;
-      c[x_addr] += block[{i, j}] * b[y_addr];
-    }
-  }
-});
-```
-
-In this code, `b.shape()[0]` is the block size along the row dimension, and `b.shape()[1]` is the block size along the column dimension.
-
-<img src="fig/block-3.png" width="50%">
-
-
-### <a name='Parallelism'></a>Parallelism 
-
-#### <a name='Reductionsalongblocksofrows'></a>Reductions along blocks of rows
-
-One way to parallelize SpMV kernel is to perform reductions along the row. Each processor only needs to store the segment of C it needs to compute, like the red box in the following figure.
-
-With respect to the `using` statement, my idea is to set one of cpos of view as the alias of `split` function. So when we call `split` function, what we actually call is the specified cpo. If the container is only range, defaultly, we use its `begin()` and `end()` to access each element without extra specification. 
-
-And I assume `row_block` is comprised of `pos` and `value`. `pos` represents the index of this row and `value` is the container of blocks.
-```c++
-/// Initialization
-auto [x, shape] = mc::generate_dense(n, 1);
-auto [y, shape] = mc::generate_dense(m, 1);
-auto [values, rowptr, colind, shape, nnz] =
-  mc::generate_bcsr(m, n, block_height, block_width, nnz);
-
-std::experimental::mdspan b(x.data(), shape[0], shape[1]);
-std::experimental::mdspan c(y.data(), shape[0], shape[1]);
-mc::bcsr_matrix_view A(values, rowptr, colind,
-                          shape, block_height, block_width, nnz);
-
-using bcsr_matrix_view::split = bcsr_matrix_view::row_blocks();
-
-mc::parallel_for(A, c, [&](auto row_block, auto c_sub){
-  mc::parallel_for(row_block.value, b, [&](auto blockzip, auto b_sub){
-    auto block = blockzip.value;
-    for (auto i = 0; i < block.height; ++ i) {
-      for (auto j = 0; j < block.width; ++ j) {
-        c_sub[i] += block[i, j] * b_sub[j];
-      }
-    }
-  });
-});
-```
-
-If we only pass one parameter to `parallel_for`, which is a different overload and is not shown in the previous section, it's more atomic but less user-friendly. 
-
-```c++
-mc::parallel_for(A, [&](auto row_blocks){ // Loop 1
-  auto c_sub = c.split()[row_blocks.pos];
-  mc::parallel_for(row_blocks, [&](auto blockzip) { // Loop 2
-    auto b_sub = b.split()[blockzip.pos];
-    auto block = blockzip.value;
-    for (auto i = 0; i < block.height; ++ i) {
-      for (auto j = 0; j < block.width; ++ j) {
-        c_sub[i] += block[i, j] * b_sub[j];
-      }
-    } 
-  });
-});
-```
-
-<img src="fig/block-4.png" width="50%">
-<!-- 
-#### <a name='Reductionsalongblocksofcolumn'></a>Reductions along blocks of column
-
-Smilarily, another way to parallelize SpMV kernel is to perform reductions along the column. 
-```c++
-/// Initialization
-auto [x, shape] = mc::generate_dense(n, 1);
-auto [y, shape] = mc::generate_dense(m, 1);
-auto [values, rowptr, colind, shape, nnz] =
-  mc::generate_bcsr(m, n, block_height, block_width, nnz);
-
-std::experimental::mdspan b(x.data(), shape[0], shape[1]);
-std::experimental::mdspan c(y.data(), shape[0], shape[1]);
-mc::bcsr_matrix_view A(values, rowptr, colind,
-                          shape, block_height, block_width, nnz);
-
-using bcsr_matrix_view::split = bcsr_matrix_view::column_blocks();
-
-mc::parallel_for(A, c, [&](auto row_block, auto c_sub){
-  mc::parallel_for(column_block, b, [&](auto blockzip, auto b_sub){
-    auto block = blockzip.value;
-    for (auto i = 0; i < block.height; ++ i) {
-      for (auto j = 0; j < block.width; ++ j) {
-        c_sub[i] += block[i, j] * b_sub[j];
-      }
-    }
-  });
-});
-```
-
-### Load Balancing
-
-Current parallelism strategies cannot achieve load balancing for sparse matrices. The number of blocks in different rows/columns may be different. 
-
-<img src="fig/block-5.png" width="50%">
-
-In this figure, each grid is treated as a block. This problem can be modeled as load balancing problem on $n$ machines. And we know longest-processing-time-first scheduling is an option for this problem.
-
-I think here is a tradeoff between the **overhead of vector replica** and **longest processing time**. For example, to avoid replicating vector element 3, we can compute block row 0, 1, 5 on the same processor, but this obviously is not optimal.
-
-### Tiling
-
-Some high-level interface for splitting up both 1D ranges and 2D matrices into tiles are required.
-
-```c++
-template<std::size_t N, __ranges::random_access_range R, typename Fn>
-constexpr void unrolled_for_each(integer<N> unroll_factor, R&& r, Fn&& fn) {
-
-}
-```
- -->
