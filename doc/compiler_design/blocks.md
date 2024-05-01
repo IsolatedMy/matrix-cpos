@@ -5,8 +5,10 @@
 * [Construction](#Construction)
 	* [BCSR Construction](#BCSRConstruction)
 	* [BCSR View](#BCSRView)
-	* [Application: SpMV](#Application:SpMV)
-	* [Application: SpMM](#Application:SpMM)
+* [Design](#Design)
+	* [SpMV](#SpMV)
+	* [SpMM](#SpMM)
+	* [Interface design](#Interfacedesign)
 
 <!-- vscode-markdown-toc-config
 	numbering=false
@@ -82,33 +84,32 @@ colind: [0, 0, 1]
 
 Another way is to use `std::mdspan` to construct views for BCSR format. Compared with `bcsr_matrix_view` way, we only pass necessary argument here. Since conversion is user-invisible, it has more user-friendly interface `mc::blocks()`.
 
-## Design
+## <a name='Design'></a>Design
 In this section, we introduce the design idea for SpMV and SpMM through the interfaces we designed. After that, we provide details of our interfaces.
 
-### <a name='Application:SpMV'></a>Application: SpMV
+### <a name='SpMV'></a>SpMV
 
 **Sparse matrix-vector multiplication (SpMV)** of the form $y = Ax$ is a widely used computational kernel existing in many scientific applications. The input matrix $A$ is sparse. The input vector $x$ and the output vector $y$ are dense.
 
 <img src="fig/block-3.png" width=50%>
 
-The following is a **dynamic** load balancing version of SpMV. The following points need to be noted:
+<!-- The following is a **dynamic** load balancing version of SpMV. The following points need to be noted:
 + `Sch` represents the strategy for parallelizing;
 + Each work item is required to fetch a task from the queue. A task is to finish a multiplication between block and sub-vector.
 + Since multiple threads can request block from `balanced_blocks`, it's necessary to set the read of `balanced_blocks` as **atomic operation**.
 + `dynamic_load_balancer` is expected to use the number of tasks `a_blocks`, the total number of work groups `num_groups` and the parallel strategy to generate work balanced queue;
 + Since the position of block cannot be determined before execution with dynamic load balancer `dynamic_load_balancer`. Therefore, the position is packed with block value in the following example, which is embodied as `x_base` and `y_base`.
-+ Block and vector `b` and `c` are all stored in global memory. Memory moves are not considered in this example.
++ Block and vector `b` and `c` are all stored in global memory. Memory moves are not considered in this example. -->
 
-```c++
+<!-- ```c++
 template <block_iterable A, random_access_range B, 
           random_access_range C, typename Sch>
 void multiply(A&& a, B&& b, C&& c, Sch&& S) {
  
   auto num_groups = 5;
   auto r = ndrange{num_groups, 512};
-  auto a_blocks = a.blocks();
 
-  auto balanced_blocks = dynamic_load_balancer(a_blocks, num_groups, S);
+  auto balanced_blocks = dynamic_load_balancer(a, num_groups, S);
  
   q.parallel_for(r, [=](auto id) {
     auto group_id = id.get_group().get_id();
@@ -130,7 +131,7 @@ void multiply(A&& a, B&& b, C&& c, Sch&& S) {
     }
   }).wait();
 }
-```
+``` -->
 
 The following version is a **static** load balancing version of SpMV. Note the following points:
 + In the original idea, each work group is assigned a row of blocks. Each work item in group is assigned a block. Whether there is a task assgined to the work item is determined by its index;
@@ -142,24 +143,22 @@ template <block_iterable A, random_access_range B,
           random_access_range C, typename Sch>
 void multiply(A&& a, B&& b, C&& c, Sch&& S) {
  
-  auto num_groups = 5;
+  auto num_groups = 128;
   auto r = ndrange{num_groups, 512};
-  auto a_blocks = a.blocks();
 
-  auto balanced_blocks = static_load_balancer(a_blocks, num_groups, S);
+  auto balanced_blocks = static_load_balancer(a, num_groups, S);
  
   q.parallel_for(r, [=](auto id) {
     auto group_id = id.get_group().get_id();
     auto thread_id = id.get_local_id(0);
     
-    if (group_id < balanced_blocks.size()) {
+    for (auto p = group_id; p < balanced_blocks.size(); p += num_groups) {
       auto blocks = balanced_blocks[group_id];
       if (thread_id < blocks.size()) {
 
         auto blockZip = blocks[thread_id];
-        auto x_base = blockZip.base()[0];
-        auto y_base = blockZip.base()[1];
-        auto block = blockZip.value();
+        auto&& [x_base, y_base] = std::get<0>(blockZip)
+        auto block = std::get<1>(blockZip)
         
         // Treat block as dense_matrix_view
         for (std::size_t i = 0; i < block.shape()[0]; i ++) {
@@ -175,7 +174,7 @@ void multiply(A&& a, B&& b, C&& c, Sch&& S) {
 }
 ```
 
-### <a name='Application:SpMM'></a>Application: SpMM
+### <a name='SpMM'></a>SpMM
 
 **Sparse matrix-matrix multiplication (SpMM, or SpGEMM)** is a computational primitive that is widely used in areas ranging from traditional numerical applications to recent big data analysis and machine learning.
 
@@ -225,7 +224,7 @@ void multiply(A&& a, B&& b, C&& c, Sch&& S) {
 }
 ```
 
-### Interface design
+### <a name='Interfacedesign'></a>Interface design
 
 ```c++
 template <typename WorkItem>
