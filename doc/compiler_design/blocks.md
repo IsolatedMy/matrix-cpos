@@ -7,8 +7,7 @@
 	* [BCSR View](#BCSRView)
 * [Design](#Design)
 	* [SpMV](#SpMV)
-	* [SpMM](#SpMM)
-	* [Interface design](#Interfacedesign)
+		* [Distribution techniques](#Distributiontechniques)
 
 <!-- vscode-markdown-toc-config
 	numbering=false
@@ -93,74 +92,46 @@ In this section, we introduce the design idea for SpMV and SpMM through the inte
 
 <img src="fig/block-3.png" width=50%>
 
-<!-- The following is a **dynamic** load balancing version of SpMV. The following points need to be noted:
-+ `Sch` represents the strategy for parallelizing;
-+ Each work item is required to fetch a task from the queue. A task is to finish a multiplication between block and sub-vector.
-+ Since multiple threads can request block from `balanced_blocks`, it's necessary to set the read of `balanced_blocks` as **atomic operation**.
-+ `dynamic_load_balancer` is expected to use the number of tasks `a_blocks`, the total number of work groups `num_groups` and the parallel strategy to generate work balanced queue;
-+ Since the position of block cannot be determined before execution with dynamic load balancer `dynamic_load_balancer`. Therefore, the position is packed with block value in the following example, which is embodied as `x_base` and `y_base`.
-+ Block and vector `b` and `c` are all stored in global memory. Memory moves are not considered in this example. -->
+#### <a name='Distributiontechniques'></a>Distribution techniques
 
-<!-- ```c++
-template <block_iterable A, random_access_range B, 
-          random_access_range C, typename Sch>
-void multiply(A&& a, B&& b, C&& c, Sch&& S) {
- 
-  auto num_groups = 5;
-  auto r = ndrange{num_groups, 512};
+In this part, we will provide three distribution technique versions of SpMV based on [this article](https://www.ibm.com/docs/en/pessl/5.3.0?topic=distributions-distribution-techniques) from IBM:
 
-  auto balanced_blocks = dynamic_load_balancer(a, num_groups, S);
- 
-  q.parallel_for(r, [=](auto id) {
-    auto group_id = id.get_group().get_id();
-    auto thread_id = id.get_local_id(0);
-    
-    atomic_ref<...> atomic_data(balanced_blocks);
-    auto&& blockZip = balanced_blocks.pop();
-    if (blockZip) {
-      auto x_base = blockZip.base()[0];
-      auto y_base = blockZip.base()[1];
-      auto block = blockZip.value();
-      for (std::size_t i = 0; i < block.shape()[0]; i ++) {
-        for (std::size_t j = 0; j < block.shape()[1]; j ++) {
-          auto x_addr = x_base + i;
-          auto y_addr = y_base + j;
-          c[x_addr] += block[{i, j}] * b[y_addr];
-        }
-      }
-    }
-  }).wait();
-}
-``` -->
-
-The following version is a **static** load balancing version of SpMV. Note the following points:
-+ In the original idea, each work group is assigned a row of blocks. Each work item in group is assigned a block. Whether there is a task assgined to the work item is determined by its index;
-+ Like dynamic version, we need to compute the offset of the block. 
-+ Block and vector `b` and `c` are all stored in global memory.
+The following code is the version of SpMV using **block distribution**. 
++ The details of `static_load_balancer` is put aside in this part;
++ Memory transfer is not considered here. The data are all stored in global memory.
 
 ```c++
 template <block_iterable A, random_access_range B, 
-          random_access_range C, typename Sch>
-void multiply(A&& a, B&& b, C&& c, Sch&& S) {
- 
-  auto num_groups = 128;
-  auto r = ndrange{num_groups, 512};
+          random_access_range C>
+void multiply(A&& a, B&& b, C&& c) {
+  auto M = 32;
+  auto N = 32;
+  auto m = 2;
+  auto n = 2;
+  auto r = ndrange{{M, N}, {m, n}};
 
-  auto balanced_blocks = static_load_balancer(a, num_groups, S);
+  auto balanced_blocks = static_load_balancer(a, {M, N});
  
   q.parallel_for(r, [=](auto id) {
-    auto group_id = id.get_group().get_id();
-    auto thread_id = id.get_local_id(0);
-    
-    for (auto p = group_id; p < balanced_blocks.size(); p += num_groups) {
-      auto blocks = balanced_blocks[group_id];
-      if (thread_id < blocks.size()) {
+    auto group_id_x = id.get_global_id()[0];
+    auto group_id_y = id.get_global_id()[1];
 
-        auto blockZip = blocks[thread_id];
-        auto&& [x_base, y_base] = std::get<0>(blockZip)
-        auto block = std::get<1>(blockZip)
-        
-        // Treat block as dense_matrix_view
+    auto local_id_x = id.get_local_id()[0];
+    auto local_id_y = id.get_local_id()[1];
+    
+    if (balanced_blocks[{group_id_x, group_id_y}]) {
+      auto blocks = balanced_blocks[{group_id_x, group_id_y}];
+
+      // Block distribution
+      auto group_size = m * n;
+      auto n_tasks = ceil(blocks.size() / group_size);
+      auto id = local_id_x * m + n;
+      for (auto ib = id * n_tasks; ib < min((id+1)*n_tasks, blocks.size()); ib ++) {
+
+        auto blockZip = blocks[ib];
+        auto&& [x_base, y_base] = std::get<0>(blockZip);
+        auto block = std::get<1>(blockZip);
+
         for (std::size_t i = 0; i < block.shape()[0]; i ++) {
           for (std::size_t j = 0; j < block.shape()[1]; j ++) {
             auto x_addr = x_base + i;
@@ -174,78 +145,33 @@ void multiply(A&& a, B&& b, C&& c, Sch&& S) {
 }
 ```
 
-### <a name='SpMM'></a>SpMM
-
-**Sparse matrix-matrix multiplication (SpMM, or SpGEMM)** is a computational primitive that is widely used in areas ranging from traditional numerical applications to recent big data analysis and machine learning.
-
-<img src="fig/block-6.png" width=70%>
-
-In the following example, each group is assigned a block like the blue block on the left side of the above figure. Each work item is required to finish multiplication between the specified block and a tile, which is like the red vector on the right side of the above figure. 
-
+The **cyclic distribution** code is as follows
 ```c++
-template <block_iterable A, dense_matrix_view B, 
-          dense_matrix_view C, typename Sch>
-void multiply(A&& a, B&& b, C&& c, Sch&& S) {
-  auto M = 32;
-  auto N = 32;
-  auto r = ndrange{{M, N}, 512};
-  auto a_blocks = a.blocks();
+if (balanced_blocks[{group_id_x, group_id_y}]) {
+  auto blocks = balanced_blocks[{group_id_x, group_id_y}];
 
-  auto balanced_blocks = static_load_balancer(a_blocks, {M, N}, S);
- 
-  q.parallel_for(r, [=](auto id) {
-    auto idx = id.get_global_id()[0];
-    auto idy = id.get_global_id()[1];
-    auto thread_id = id.get_local_id(0);
-    
-    if (m < balanced_blocks.shape()[0] && n < balanced_blocks.shape()[1]) {
-      auto blockZip = balanced_blocks[{idx, idy}];
-
-      // If thread_id is less than the width of B,
-      // it can be assigned a matrix-vector multiplication task.
-      if (thread_id < B.shape()[1]) {
-        auto blockZip = blocks[thread_id];
-        auto x_base = blockZip.base()[0];
-        auto y_base = blockZip.base()[1];
-        auto block = blockZip.value();
-
-        for (std::size_t i = 0; i < bm; i ++) {
-          for (std::size_t j = 0; j < bn; j ++) {
-            auto x_addr = x_base + i;
-            auto y_addr = y_base + j;
-
-            // Use the access features of dense_matrix_view
-            c[{x_addr, thread_id}] += block[{i, j}] * b[{y_addr, thread_id}];
-          }
-        }
-      }
-    }
-  }).wait();
+  // Cyclic distribution
+  auto group_size = m * n;
+  auto id = local_id_x * m + n;
+  for (auto ib = id; ib < blocks.size(); ib += group_size) 
+  
+  /// ...
 }
 ```
 
-### <a name='Interfacedesign'></a>Interface design
-
+The **block-cyclic distribution** code is as follows
 ```c++
-template <typename WorkItem>
-class work_balanced_iterator {
-  auto *operator() {
-    return q_->pop();
+if (balanced_blocks[{group_id_x, group_id_y}]) {
+  auto blocks = balanced_blocks[{group_id_x, group_id_y}];
+
+  // Block-cyclic distribution
+  auto group_size = m * n;
+  auto r = 2;   // Block size for each work-item
+  auto id = local_id_x * m + n;
+  for (auto ib_base = id; ib_base < blocks.size(); ib_base += group_size * r) {
+    for (auto ib = ib_base; ib < ib_base + r; ib_base++ ) {
+        /// ...
+    }
   }
-private:
-  std::shared_ptr<queue<WorkItem>> q_;
-};
- 
-template <typename WorkItem>
-class work_balanced_range {
-public:
-  auto begin() {
-    return iterator();
-  }
-  auto end() {
-    sentinel();
-  }
-private:
-  std::shared_ptr<atomic_queue<WorkItem>> q_;
-};
+}
 ```
