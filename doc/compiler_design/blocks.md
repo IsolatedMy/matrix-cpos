@@ -177,67 +177,86 @@ if (balanced_blocks[{group_id_x, group_id_y}]) {
 }
 ```
 
-#### <a name='StaticLoadBalancer'></a>Static Load Balancer
+#### Load balancer
 
-The static load balancer is designed as follows:
+Static block-distribution balancer.
 
 ```c++
-template <random_access_range R, typename I>
-auto static_load_balancer(R&& a, mc::index<I> group_shape) {
+// Number 1: static block distribution balancer
+template <std::ranges::random_access_range R>
+auto static_load_balancer(R&& range, size_t num_chunks) {
+  auto chunk_size = ceil((float)range.size() / num_chunks)
+  auto balanced_chunks = range | std::views::chunk(chunk_size);
+  return balanced_chunks;
+}
 
-  // Accumulate data units in different sparse format
-	std::vector<BlockZip> blocks;
+/*
+ * Example input/output
+ * range: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+ * num_chunks: 2
+ * output: [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]]
+ * 
+ * num_chunks: 5
+ * output: [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]
+*/
+```
 
-	auto M = group_shape.get(0);
-	auto N = group_shape.get(1);
-	auto group_size = M*N;
+Static block-cyclic-distribution balancer.
 
-	for (auto&& [i, row] : a.row_blocks()) {
-      for (auto&& [j, block] : row) {
-	    blocks.push_back(mc::index<I>(i,j), block);
-	  }
-	}
+```c++
+// Number 2: static blcok cyclic distribution balancer
+template <std::range::random_access_range R>
+auto static_load_balancer(R&& range, size_t num_ranges, size_t chunk_size) {
+  auto chunks = range | std::views::chunk(chunk_size);
+  auto range_size = ceil((float)chunks.size() / num_ranges);
+  auto balanced_groups = chunks | std::views::chunk(range_size);
+  return balanced_groups;
+}
 
-  // Block distribution
-	auto aver = ceil(blocks.size() / group_size);
-	auto group_id = __ranges::views::iota(I(0), I(group_size));
-	auto balanced_blocks = 
-	  group_id | __ranges::views::transform(
-	  [*this](auto index) {
-	    auto start = index * aver;	
-	    auto end = min((index + 1)*aver, blocks.size());
-	    __ranges::subrange group_blocks(ranges::begin(blocks) + start,
-									    ranges::begin(blocks) + end);
-		return __ranges::views::zip(index, group_blocks);
-	  });
-	return balanced_blocks;
+/*
+ * Example input/output
+ * range: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+ * num_range: 2
+ * chunk_size: 3
+ * output: [[[0, 1, 2], [3, 4, 5]], [[6, 7, 8], [9]]]
+ * 
+ * Worker 1 sees: [[0, 1, 2], [3, 4, 5]]
+ * Worker 2 sees: [[6, 7, 8], [9]]
+ * 
+ * P.S. Actually, in block-cyclic distribution
+ * Worker 1 sees: [[0, 1, 2], [6, 7, 8]]
+ * Worker 2 sees: [[3, 4, 5], [9]]
+*/
+
+template <std::range::random_access_range R>
+auto static_load_balancer(R&& range, size_t num_ranges, size_t chunk_size) {
+  auto chunks = range | std::views::chunk(chunk_size);
+  auto group_ids = __ranges::views::iota(I(0), I(num_ranges));
+  auto balanced_groups = group_ids | __ranges::views::transform(
+    [=](auto group_id) {
+      return __ranges::subrange(chunks + group_id, ranges::end(chunks)) | stride(num_ranges);
+    }
+  );
+  return balanced_groups;
 }
 ```
 
-The `BlockZip` structure used to include position and value is defined as follows.
+Dynamic balancer.
 
 ```c++
-template<typename T>
-struct BlockZip {
-	mc::index<T> loc;
-	Block value;
-	Block(mc::index<T> _loc, Block _value) : loc(_loc), value(_value) {}
-};
+template <std::ranges::random_access_range R>
+auto dynamic_load_balancer(R&& range, size_t num_ranges, size_t chunk_size) {
+}
+
+/*
+ * Example input:
+ * range: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+ * num_ranges: 2
+ * job_size: 2
+ * output [(*load_balance_queue object*), (load_balance_queue object)]
+ * 
+ * Worker 1 sees: [[0, 1], [6, 7], ...]
+ * Worker 2 sees: [[2, 3], [4, 5], [8, 9], ...]
+ * 
+*/
 ```
-
-The following is cyclic distribution version.
-
-```c++
-// Cyclic distrbution
-auto group_id = __ranges::views::iota(I(0), I(group_size));
-auto balanced_blocks = 
-  group_id | __ranges::views::transform(
-  [*this](auto index) {   
-  auto raw_group_blocks =
-    __ranges::subrange(ranges::begin(blocks) + index, 
-              ranges::end(blocks)) |
-    __ranges::views::stride(group_size);
-  return __ranges::views::zip(index, raw_group_blocks);
-  });
-```
-
